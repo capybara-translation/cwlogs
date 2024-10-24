@@ -5,7 +5,7 @@ cwlogs prints Log Events for AWS CloudWatch.
 # Usage
 
 ```
-$ ./cwlogs <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD>
+$ ./cwlogs <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD> [<aws_profile>]
 
 ```
 
