@@ -13,8 +13,12 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 4 {
-		log.Fatalf("Usage: %s <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD>", os.Args[0])
+	if len(os.Args) < 4 || len(os.Args) > 5 {
+		log.Fatalf("Usage: %s <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD> [<aws_profile>]", os.Args[0])
+	}
+	profile := "default"
+	if len(os.Args) == 5 {
+		profile = os.Args[4]
 	}
 
 	logGroupName := os.Args[1]
@@ -36,7 +40,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile("default"))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
 	if err != nil {
 		log.Fatal(err)
 	}
