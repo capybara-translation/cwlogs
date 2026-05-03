@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -13,30 +14,36 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 4 || len(os.Args) > 5 {
-		log.Fatalf("Usage: %s <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD> [<aws_profile>]", os.Args[0])
+	utc := flag.Bool("utc", false, "interpret start/end dates as UTC instead of the local timezone")
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(),
+			"Usage: %s [--utc] <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD> [<aws_profile>]\n",
+			os.Args[0])
+		flag.PrintDefaults()
 	}
+	flag.Parse()
+
+	if flag.NArg() < 3 || flag.NArg() > 4 {
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	logGroupName := flag.Arg(0)
+	startDateStr := flag.Arg(1)
+	endDateStr := flag.Arg(2)
 	profile := "default"
-	if len(os.Args) == 5 {
-		profile = os.Args[4]
+	if flag.NArg() == 4 {
+		profile = flag.Arg(3)
 	}
 
-	logGroupName := os.Args[1]
-	startDateStr := os.Args[2]
-	endDateStr := os.Args[3]
-
-	// Define string date format
-	const layout = "20060102"
-
-	// Parse date string with the system's local timezone
-	startDate, err := time.ParseInLocation(layout, startDateStr, time.Local)
-	if err != nil {
-		log.Fatalf("Invalid start date format: %v", err)
+	loc := time.Local
+	if *utc {
+		loc = time.UTC
 	}
 
-	endDate, err := time.ParseInLocation(layout, endDateStr, time.Local)
+	startTime, endTime, err := computeTimeRange(startDateStr, endDateStr, loc)
 	if err != nil {
-		log.Fatalf("Invalid end date format: %v", err)
+		log.Fatal(err)
 	}
 
 	ctx := context.Background()
@@ -46,9 +53,6 @@ func main() {
 	}
 
 	client := cloudwatchlogs.NewFromConfig(cfg)
-	startTime := startDate.UnixMilli()
-	// Set endDate at 23:59:59
-	endTime := endDate.Add(23*time.Hour + 59*time.Minute + 59*time.Second).UnixMilli()
 	var nextToken *string
 	for {
 		logEventInput := &cloudwatchlogs.FilterLogEventsInput{
@@ -74,4 +78,26 @@ func main() {
 		nextToken = logEventsOutput.NextToken
 	}
 
+}
+
+// computeTimeRange parses startStr and endStr as YYYYMMDD in loc and returns
+// the inclusive [start, end] range in Unix milliseconds. The end time is the
+// last millisecond of the end date in loc (wall-clock 23:59:59.999), computed
+// via the next day's 00:00:00 to remain correct across DST transitions.
+func computeTimeRange(startStr, endStr string, loc *time.Location) (int64, int64, error) {
+	const layout = "20060102"
+
+	startDate, err := time.ParseInLocation(layout, startStr, loc)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid start date format: %w", err)
+	}
+
+	endDate, err := time.ParseInLocation(layout, endStr, loc)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid end date format: %w", err)
+	}
+
+	startMs := startDate.UnixMilli()
+	endMs := time.Date(endDate.Year(), endDate.Month(), endDate.Day()+1, 0, 0, 0, 0, loc).UnixMilli() - 1
+	return startMs, endMs, nil
 }
