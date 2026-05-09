@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -21,12 +22,48 @@ const (
 	formatJSONL    = "jsonl"
 )
 
+// version is overridden at build time via `-ldflags "-X main.version=..."`
+// (set by GoReleaser). When that override is absent, init() consults
+// debug.ReadBuildInfo to pick up the module version embedded by
+// `go install ...@vX.Y.Z`. Pseudo versions (commit-hash based, "+dirty", etc.)
+// and "(devel)" are deliberately rejected so a local build never surfaces a
+// version string that looks like a real release.
+var version = "dev"
+
+func init() {
+	info, _ := debug.ReadBuildInfo()
+	version = resolveVersion(version, info)
+}
+
+// resolveVersion picks the effective version string from either the ldflags
+// override (ldVersion) or the build info embedded by Go modules. It is split
+// out from init() so it can be tested without rebuilding with custom ldflags.
+//
+// Pseudo versions starting with "v0.0.0-" (Go's auto-generated commit-hash
+// based versions, e.g. when installing from a non-tagged commit or a dirty
+// tree) are intentionally treated as "dev": surfacing them as if they were
+// releases makes bug reports ambiguous about which exact build is running.
+func resolveVersion(ldVersion string, info *debug.BuildInfo) string {
+	if ldVersion != "dev" {
+		return ldVersion
+	}
+	if info == nil {
+		return "dev"
+	}
+	v := info.Main.Version
+	if v == "" || v == "(devel)" || strings.HasPrefix(v, "v0.0.0-") {
+		return "dev"
+	}
+	return v
+}
+
 func main() {
 	utc := flag.Bool("utc", false, "interpret start/end timestamps as UTC instead of the local timezone")
 	profile := flag.String("profile", "", "AWS shared config profile name (default: SDK default resolution, including AWS_PROFILE)")
 	region := flag.String("region", "", "AWS region (overrides profile/env default)")
 	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable output normalization (converting \\r\\n and \\r to \\n, and collapsing any trailing run of \\n to a single \\n)")
 	format := flag.String("format", formatRaw, "output format: raw | with-time | jsonl")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
 			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] [--format <format>] <log_group_name> <start> <end>\n"+
@@ -36,6 +73,11 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("cwlogs " + version)
+		return
+	}
 
 	if flag.NArg() != 3 {
 		fmt.Fprintf(flag.CommandLine.Output(), "error: expected 3 positional arguments, got %d\n", flag.NArg())

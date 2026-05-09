@@ -2,6 +2,42 @@
 
 cwlogs prints Log Events for AWS CloudWatch. 
 
+# Install
+
+## Homebrew (macOS / Linux)
+
+```
+brew install capybara-translation/tap/cwlogs
+```
+
+## go install
+
+```
+go install github.com/capybara-translation/cwlogs/cmd/cwlogs@latest
+```
+
+## Pre-built binaries
+
+Download the archive for your platform from the [Releases page](https://github.com/capybara-translation/cwlogs/releases) and extract the `cwlogs` binary into a directory on your `PATH`.
+
+## Build from source
+
+```
+git clone https://github.com/capybara-translation/cwlogs.git
+cd cwlogs
+go build -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty)" -o cwlogs ./cmd/cwlogs
+```
+
+The version reported by `cwlogs --version` depends on the build path:
+
+| Build path | `cwlogs --version` |
+|---|---|
+| Homebrew / GitHub Releases (built by GoReleaser) | the released tag, e.g. `cwlogs v1.2.3` |
+| `go install ...@vX.Y.Z` | `cwlogs vX.Y.Z` |
+| `go install ...@latest` from a non-tagged commit | `cwlogs dev` (pseudo versions are intentionally hidden) |
+| Manual `go build` with the `ldflags` example above | whatever `git describe` resolves to |
+| Plain `go build` without `ldflags` | `cwlogs dev` |
+
 # Usage
 
 ```

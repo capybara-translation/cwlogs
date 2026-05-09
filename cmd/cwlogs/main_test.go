@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -570,5 +571,33 @@ func TestFormatEvent_UnknownFormat(t *testing.T) {
 	_, err := formatEvent(0, "x", "s", "bogus", time.UTC)
 	if err == nil {
 		t.Errorf("expected error for unknown format, got nil")
+	}
+}
+
+func TestResolveVersion(t *testing.T) {
+	mod := func(v string) *debug.BuildInfo { return &debug.BuildInfo{Main: debug.Module{Version: v}} }
+	cases := []struct {
+		name      string
+		ldVersion string
+		info      *debug.BuildInfo
+		want      string
+	}{
+		{"ldflags release version wins regardless of build info", "v1.2.3", mod("v0.0.0-20260509071102-deadbeefcafe"), "v1.2.3"},
+		{"ldflags release version wins even when info is nil", "v1.2.3", nil, "v1.2.3"},
+		{"ldflags = dev with no build info -> dev", "dev", nil, "dev"},
+		{"ldflags = dev, build info reports (devel) -> dev", "dev", mod("(devel)"), "dev"},
+		{"ldflags = dev, build info reports empty version -> dev", "dev", mod(""), "dev"},
+		{"ldflags = dev, pseudo version -> dev (avoid masquerading as release)", "dev", mod("v0.0.0-20260509071102-deadbeefcafe"), "dev"},
+		{"ldflags = dev, dirty pseudo version -> dev", "dev", mod("v0.0.0-20260509071102-deadbeefcafe+dirty"), "dev"},
+		{"ldflags = dev, real release version from go install -> use it", "dev", mod("v1.2.3"), "v1.2.3"},
+		{"ldflags = dev, prerelease tag from go install -> use it", "dev", mod("v1.2.3-rc.1"), "v1.2.3-rc.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveVersion(tc.ldVersion, tc.info)
+			if got != tc.want {
+				t.Errorf("resolveVersion(%q, %+v) = %q, want %q", tc.ldVersion, tc.info, got, tc.want)
+			}
+		})
 	}
 }
