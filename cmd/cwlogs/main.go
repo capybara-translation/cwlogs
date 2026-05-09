@@ -15,15 +15,18 @@ import (
 
 func main() {
 	utc := flag.Bool("utc", false, "interpret start/end dates as UTC instead of the local timezone")
+	profile := flag.String("profile", "", "AWS shared config profile name (default: SDK default resolution, including AWS_PROFILE)")
+	region := flag.String("region", "", "AWS region (overrides profile/env default)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"Usage: %s [--utc] <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD> [<aws_profile>]\n",
+			"Usage: %s [--utc] [--profile <name>] [--region <region>] <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD>\n",
 			os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if flag.NArg() < 3 || flag.NArg() > 4 {
+	if flag.NArg() != 3 {
+		fmt.Fprintf(flag.CommandLine.Output(), "error: expected 3 positional arguments, got %d\n", flag.NArg())
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -31,10 +34,6 @@ func main() {
 	logGroupName := flag.Arg(0)
 	startDateStr := flag.Arg(1)
 	endDateStr := flag.Arg(2)
-	profile := "default"
-	if flag.NArg() == 4 {
-		profile = flag.Arg(3)
-	}
 
 	loc := time.Local
 	if *utc {
@@ -47,7 +46,14 @@ func main() {
 	}
 
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile))
+	var opts []func(*config.LoadOptions) error
+	if *profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(*profile))
+	}
+	if *region != "" {
+		opts = append(opts, config.WithRegion(*region))
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
