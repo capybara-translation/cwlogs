@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,15 +15,23 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 )
 
+const (
+	formatRaw      = "raw"
+	formatWithTime = "with-time"
+	formatJSONL    = "jsonl"
+)
+
 func main() {
 	utc := flag.Bool("utc", false, "interpret start/end timestamps as UTC instead of the local timezone")
 	profile := flag.String("profile", "", "AWS shared config profile name (default: SDK default resolution, including AWS_PROFILE)")
 	region := flag.String("region", "", "AWS region (overrides profile/env default)")
-	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable output normalization (converting \\r\\n and \\r to \\n, and appending a trailing \\n when missing)")
+	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable output normalization (converting \\r\\n and \\r to \\n, and collapsing any trailing run of \\n to a single \\n)")
+	format := flag.String("format", formatRaw, "output format: raw | with-time | jsonl")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] <log_group_name> <start> <end>\n"+
-				"  <start>, <end>: YYYYMMDD | YYYY-MM-DD | YYYY-MM-DDTHH:MM:SS\n",
+			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] [--format <format>] <log_group_name> <start> <end>\n"+
+				"  <start>, <end>: YYYYMMDD | YYYY-MM-DD | YYYY-MM-DDTHH:MM:SS\n"+
+				"  <format>:       raw (default) | with-time | jsonl\n",
 			os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -30,6 +39,14 @@ func main() {
 
 	if flag.NArg() != 3 {
 		fmt.Fprintf(flag.CommandLine.Output(), "error: expected 3 positional arguments, got %d\n", flag.NArg())
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	switch *format {
+	case formatRaw, formatWithTime, formatJSONL:
+	default:
+		fmt.Fprintf(flag.CommandLine.Output(), "error: unknown --format value %q (expected raw, with-time, or jsonl)\n", *format)
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -82,7 +99,11 @@ func main() {
 				msg = normalizeNewlines(msg)
 				msg = ensureTrailingNewline(msg)
 			}
-			fmt.Print(msg)
+			out, err := formatEvent(aws.ToInt64(logEvent.Timestamp), msg, aws.ToString(logEvent.LogStreamName), *format, loc)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Print(out)
 		}
 
 		if logEventsOutput.NextToken == nil {
@@ -176,14 +197,70 @@ func normalizeNewlines(s string) string {
 	return s
 }
 
-// ensureTrailingNewline appends "\n" to s if it doesn't already end with one.
-// CloudWatch Logs does not guarantee that Message ends with a newline, so this
-// keeps each event on its own line in the CLI output. An empty input becomes
-// "\n" by design: an empty event is preserved as a visible blank line rather
-// than swallowed silently, which matches how it would render in the AWS console.
+// ensureTrailingNewline normalizes the trailing newline run of s so the result
+// always ends with exactly one "\n":
+//
+//   - "foo"        -> "foo\n"
+//   - "foo\n"      -> "foo\n"
+//   - "foo\n\n\n"  -> "foo\n"  (collapses trailing run, common in build logs
+//                                that embed "\n\n" before the next section)
+//   - ""           -> "\n"     (blank events stay visible as a blank line)
+//   - "\n\n"       -> "\n"
+//
+// This keeps each CloudWatch event on exactly one line in the CLI output
+// while preserving blank events so timestamps and ordering are not lost.
 func ensureTrailingNewline(s string) string {
-	if strings.HasSuffix(s, "\n") {
-		return s
+	return strings.TrimRight(s, "\n") + "\n"
+}
+
+// formatTimestamp renders a CloudWatch Logs timestamp (Unix milliseconds) as
+// ISO 8601 with millisecond precision in loc. The "Z07:00" trailer collapses
+// to "Z" for UTC and expands to "+09:00" / "-05:00" / etc. for other zones.
+func formatTimestamp(ms int64, loc *time.Location) string {
+	return time.UnixMilli(ms).In(loc).Format("2006-01-02T15:04:05.000Z07:00")
+}
+
+// formatEvent renders a single log event in the requested output format.
+// The message argument is expected to be already-normalized (or raw, if the
+// caller chose to skip normalization). Unknown format values return an error
+// rather than silently falling back, so the CLI surface stays in sync with
+// what main accepts.
+func formatEvent(timestampMs int64, message, stream, format string, loc *time.Location) (string, error) {
+	switch format {
+	case formatRaw:
+		return message, nil
+	case formatWithTime:
+		// The line must terminate with \n so a blank-message event (which
+		// carries only a timestamp) still occupies its own line.
+		line := formatTimestamp(timestampMs, loc) + "\t" + message
+		if !strings.HasSuffix(line, "\n") {
+			line += "\n"
+		}
+		return line, nil
+	case formatJSONL:
+		// SetEscapeHTML(false) keeps "<", ">", "&" readable in log payloads.
+		// json.Marshal would otherwise escape them to < etc.
+		var buf strings.Builder
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(struct {
+			Timestamp string `json:"timestamp"`
+			Stream    string `json:"stream"`
+			Message   string `json:"message"`
+		}{
+			Timestamp: formatTimestamp(timestampMs, loc),
+			Stream:    stream,
+			Message:   message,
+		}); err != nil {
+			return "", fmt.Errorf("encode jsonl event: %w", err)
+		}
+		// json.Encoder always appends a newline, so the result is one event
+		// per line as advertised.
+		return buf.String(), nil
+	default:
+		// main pre-validates the --format value, so this branch is unreachable
+		// in normal CLI use. It exists for direct callers (tests, future
+		// embedding) that bypass the CLI entry point.
+		return "", fmt.Errorf("unknown format %q", format)
 	}
-	return s + "\n"
 }

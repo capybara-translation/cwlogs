@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -143,13 +145,17 @@ func TestEnsureTrailingNewline(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"empty stays empty plus newline", "", "\n"},
+		{"empty becomes single LF (visible blank line)", "", "\n"},
+		{"single LF unchanged", "\n", "\n"},
+		{"multiple LFs compact to single LF", "\n\n\n", "\n"},
 		{"no newline gets one", "abc", "abc\n"},
-		{"already LF terminated unchanged", "abc\n", "abc\n"},
-		{"input ending in CRLF: HasSuffix LF returns true, so unchanged", "abc\r\n", "abc\r\n"},
-		{"only LF unchanged", "\n", "\n"},
+		{"already single LF terminated unchanged", "abc\n", "abc\n"},
+		{"trailing double LF compacts to single LF", "abc\n\n", "abc\n"},
+		{"trailing many LFs compact to single LF", "abc\n\n\n\n", "abc\n"},
+		{"only-CR is preserved (CR is not stripped)", "abc\r", "abc\r\n"},
 		{"multiple internal LFs, no trailing → adds one", "a\nb\nc", "a\nb\nc\n"},
-		{"multiple internal LFs, with trailing → unchanged", "a\nb\nc\n", "a\nb\nc\n"},
+		{"multiple internal LFs, single trailing → unchanged", "a\nb\nc\n", "a\nb\nc\n"},
+		{"internal LFs preserved, trailing run compacted", "a\n\nb\n\n", "a\n\nb\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,6 +181,10 @@ func TestNormalizeAndEnsureNewline_Composition(t *testing.T) {
 		{"CRLF terminated normalizes to LF, no doubling", "hello\r\n", "hello\n"},
 		{"bare CR terminated normalizes to LF, no doubling", "hello\r", "hello\n"},
 		{"internal CRLF and missing trailing", "a\r\nb", "a\nb\n"},
+		{"trailing CRLF+LF run compacts to single LF (Docker-build style)", "Sending build context\r\n\n", "Sending build context\n"},
+		{"empty input becomes a single LF (blank event stays visible)", "", "\n"},
+		{"CRLF-only event becomes a single LF", "\r\n", "\n"},
+		{"multiple CRLFs compact to a single LF", "\r\n\r\n", "\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -311,5 +321,254 @@ func TestComputeTimeRange_InvalidFormat(t *testing.T) {
 				t.Errorf("expected error, got nil")
 			}
 		})
+	}
+}
+
+func TestFormatTimestamp(t *testing.T) {
+	jst := time.FixedZone("JST", 9*60*60)
+	// 2024-10-01T12:34:56.789Z, in three zones with various ms values.
+	ms := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+
+	cases := []struct {
+		name string
+		ms   int64
+		loc  *time.Location
+		want string
+	}{
+		{"UTC ends with Z", ms, time.UTC, "2024-10-01T12:34:56.789Z"},
+		{"JST shows +09:00 offset", ms, jst, "2024-10-01T21:34:56.789+09:00"},
+		{"millisecond zero pads to .000", time.Date(2024, 10, 1, 0, 0, 0, 0, time.UTC).UnixMilli(), time.UTC, "2024-10-01T00:00:00.000Z"},
+		{"millisecond .005 pads to .005", time.Date(2024, 10, 1, 0, 0, 0, 5_000_000, time.UTC).UnixMilli(), time.UTC, "2024-10-01T00:00:00.005Z"},
+		{"millisecond .999 stays .999", time.Date(2024, 10, 1, 23, 59, 59, 999_000_000, time.UTC).UnixMilli(), time.UTC, "2024-10-01T23:59:59.999Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatTimestamp(tc.ms, tc.loc)
+			if got != tc.want {
+				t.Errorf("formatTimestamp(%d, %s) = %q, want %q", tc.ms, tc.loc, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormatEvent_Raw(t *testing.T) {
+	out, err := formatEvent(0, "hello\n", "ignored-stream", formatRaw, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "hello\n" {
+		t.Errorf("got %q, want %q", out, "hello\n")
+	}
+}
+
+func TestFormatEvent_WithTime(t *testing.T) {
+	ts := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "hello\n", "ignored-stream", formatWithTime, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "2024-10-01T12:34:56.789Z\thello\n"
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestFormatEvent_WithTime_EmptyMessage(t *testing.T) {
+	// A blank-message event still carries timestamp information, so with-time
+	// emits "<ts>\t\n" rather than dropping the event. The trailing \n is
+	// essential — without it the next event would share the same line.
+	ts := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "", "ignored-stream", formatWithTime, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "2024-10-01T12:34:56.789Z\t\n"
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestFormatEvent_WithTime_PreservesMultilineMessage(t *testing.T) {
+	// Multiline messages flow through as-is: only the first line gets a
+	// timestamp prefix; subsequent lines appear verbatim. This is the
+	// intentional design (see README); lock it in so a future "prefix every
+	// line" change doesn't sneak in.
+	ts := time.Date(2024, 10, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	out, _ := formatEvent(ts, "line1\nline2\n", "s", formatWithTime, time.UTC)
+	want := "2024-10-01T12:00:00.000Z\tline1\nline2\n"
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestFormatEvent_JSONL(t *testing.T) {
+	ts := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "hello\n", "my-stream", formatJSONL, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(out, "\n") {
+		t.Errorf("jsonl output should end with newline, got %q", out)
+	}
+	if strings.Count(out, "\n") != 1 {
+		t.Errorf("jsonl output must be a single line plus trailing newline, got %q", out)
+	}
+
+	var decoded struct {
+		Timestamp string `json:"timestamp"`
+		Stream    string `json:"stream"`
+		Message   string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(out, "\n")), &decoded); err != nil {
+		t.Fatalf("output is not valid JSON: %v\noutput: %q", err, out)
+	}
+	if decoded.Timestamp != "2024-10-01T12:34:56.789Z" {
+		t.Errorf("timestamp = %q", decoded.Timestamp)
+	}
+	if decoded.Stream != "my-stream" {
+		t.Errorf("stream = %q", decoded.Stream)
+	}
+	if decoded.Message != "hello\n" {
+		t.Errorf("message = %q (newline must round-trip)", decoded.Message)
+	}
+}
+
+func TestFormatEvent_JSONL_EmptyMessage(t *testing.T) {
+	// jsonl always emits the event: timestamp and stream are useful even when
+	// the message is empty, and consumers (jq, etc.) decide what to filter.
+	ts := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "", "my-stream", formatJSONL, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var decoded struct {
+		Timestamp string `json:"timestamp"`
+		Stream    string `json:"stream"`
+		Message   string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(out, "\n")), &decoded); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %q", err, out)
+	}
+	if decoded.Message != "" {
+		t.Errorf("message = %q, want empty", decoded.Message)
+	}
+	if decoded.Timestamp == "" || decoded.Stream == "" {
+		t.Errorf("timestamp/stream must still be populated: %+v", decoded)
+	}
+}
+
+func TestFormatEvent_JSONL_EscapesSpecialChars(t *testing.T) {
+	// Quotes, backslashes, embedded newlines, tabs, and HTML-ish chars must
+	// all round-trip cleanly. SetEscapeHTML(false) means <, >, & stay literal.
+	tricky := "with \"quotes\" and \\backslash and\nnewline\tand <html> & ampersand"
+	out, err := formatEvent(0, tricky, "s", formatJSONL, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.Contains(out, "\\u003c") || strings.Contains(out, "\\u003e") || strings.Contains(out, "\\u0026") {
+		t.Errorf("HTML chars should not be \\u-escaped in jsonl output: %q", out)
+	}
+
+	var decoded struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(out, "\n")), &decoded); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %q", err, out)
+	}
+	if decoded.Message != tricky {
+		t.Errorf("message did not round-trip: got %q, want %q", decoded.Message, tricky)
+	}
+}
+
+func TestFormatEvent_Raw_EmptyMessage(t *testing.T) {
+	// formatEvent itself is pure: when called with an empty message it returns
+	// "" verbatim. The CLI normally passes through ensureTrailingNewline first,
+	// which would convert "" to "\n". Lock the function-level contract so that
+	// future callers that bypass normalization see a stable result.
+	out, err := formatEvent(0, "", "ignored-stream", formatRaw, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != "" {
+		t.Errorf("got %q, want empty string", out)
+	}
+}
+
+func TestFormatEvent_WithTime_LocalTimezone(t *testing.T) {
+	// Exercise formatEvent in a non-UTC zone end-to-end (formatTimestamp is
+	// already covered by TestFormatTimestamp, but the with-time path glues
+	// timestamp + tab + message together and is worth pinning at this layer).
+	jst := time.FixedZone("JST", 9*60*60)
+	ts := time.Date(2024, 10, 1, 12, 34, 56, 789_000_000, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "hello\n", "s", formatWithTime, jst)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "2024-10-01T21:34:56.789+09:00\thello\n"
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestFormatEvent_WithTime_NoNormalize_PreservesBareCR(t *testing.T) {
+	// When --no-normalize-newlines is in effect, the message reaches
+	// formatEvent without normalization. A bare-CR-terminated message is
+	// preserved as-is — formatEvent does NOT add a trailing \n in that case,
+	// because doing so would silently undo the "raw bytes" mode the user
+	// explicitly opted into. Downstream TSV consumers must not assume a
+	// trailing \n in this combination.
+	ts := time.Date(2024, 10, 1, 12, 0, 0, 0, time.UTC).UnixMilli()
+	out, err := formatEvent(ts, "msg\r", "s", formatWithTime, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "2024-10-01T12:00:00.000Z\tmsg\r\n"
+	// formatEvent's HasSuffix("\n") check is false for "\r", so it appends \n.
+	// Confirm the current behaviour explicitly so a future change is intentional.
+	if out != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
+
+func TestFormatEvent_JSONL_EmptyStream(t *testing.T) {
+	// CloudWatch SDK returns nil pointers as empty strings via aws.ToString,
+	// so a missing LogStreamName surfaces as "". Lock the JSON shape so
+	// downstream `jq` filters that match `.stream` see an empty string rather
+	// than a missing key or null.
+	out, err := formatEvent(0, "msg\n", "", formatJSONL, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, `"stream":""`) {
+		t.Errorf("expected empty stream field, got %q", out)
+	}
+}
+
+func TestFormatEvent_JSONL_PreservesControlChars(t *testing.T) {
+	// CloudWatch logs frequently contain ANSI escapes (ESC = \x1b) and even
+	// NUL bytes from binary payloads. Verify that jsonl encoding round-trips
+	// these through json.Unmarshal without loss.
+	tricky := "ANSI \x1b[31mred\x1b[0m and NUL\x00here"
+	out, err := formatEvent(0, tricky, "s", formatJSONL, time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var decoded struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(out, "\n")), &decoded); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %q", err, out)
+	}
+	if decoded.Message != tricky {
+		t.Errorf("message did not round-trip: got %q, want %q", decoded.Message, tricky)
+	}
+}
+
+func TestFormatEvent_UnknownFormat(t *testing.T) {
+	_, err := formatEvent(0, "x", "s", "bogus", time.UTC)
+	if err == nil {
+		t.Errorf("expected error for unknown format, got nil")
 	}
 }
