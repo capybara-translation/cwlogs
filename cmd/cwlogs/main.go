@@ -18,7 +18,7 @@ func main() {
 	utc := flag.Bool("utc", false, "interpret start/end dates as UTC instead of the local timezone")
 	profile := flag.String("profile", "", "AWS shared config profile name (default: SDK default resolution, including AWS_PROFILE)")
 	region := flag.String("region", "", "AWS region (overrides profile/env default)")
-	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable normalization of \\r\\n and \\r in log messages to \\n")
+	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable output normalization (converting \\r\\n and \\r to \\n, and appending a trailing \\n when missing)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
 			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD>\n",
@@ -79,6 +79,7 @@ func main() {
 			msg := aws.ToString(logEvent.Message)
 			if !*noNormalizeNewlines {
 				msg = normalizeNewlines(msg)
+				msg = ensureTrailingNewline(msg)
 			}
 			fmt.Print(msg)
 		}
@@ -120,4 +121,16 @@ func normalizeNewlines(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	return s
+}
+
+// ensureTrailingNewline appends "\n" to s if it doesn't already end with one.
+// CloudWatch Logs does not guarantee that Message ends with a newline, so this
+// keeps each event on its own line in the CLI output. An empty input becomes
+// "\n" by design: an empty event is preserved as a visible blank line rather
+// than swallowed silently, which matches how it would render in the AWS console.
+func ensureTrailingNewline(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	return s + "\n"
 }

@@ -137,6 +137,55 @@ func TestNormalizeNewlines(t *testing.T) {
 	}
 }
 
+func TestEnsureTrailingNewline(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty stays empty plus newline", "", "\n"},
+		{"no newline gets one", "abc", "abc\n"},
+		{"already LF terminated unchanged", "abc\n", "abc\n"},
+		{"input ending in CRLF: HasSuffix LF returns true, so unchanged", "abc\r\n", "abc\r\n"},
+		{"only LF unchanged", "\n", "\n"},
+		{"multiple internal LFs, no trailing → adds one", "a\nb\nc", "a\nb\nc\n"},
+		{"multiple internal LFs, with trailing → unchanged", "a\nb\nc\n", "a\nb\nc\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ensureTrailingNewline(tc.in)
+			if got != tc.want {
+				t.Errorf("ensureTrailingNewline(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeAndEnsureNewline_Composition(t *testing.T) {
+	// Verify the composition order used in main: normalizeNewlines first,
+	// then ensureTrailingNewline. This ensures \r\n / \r terminated messages
+	// don't end up double-newlined.
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain text needs newline", "hello", "hello\n"},
+		{"already LF terminated", "hello\n", "hello\n"},
+		{"CRLF terminated normalizes to LF, no doubling", "hello\r\n", "hello\n"},
+		{"bare CR terminated normalizes to LF, no doubling", "hello\r", "hello\n"},
+		{"internal CRLF and missing trailing", "a\r\nb", "a\nb\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ensureTrailingNewline(normalizeNewlines(tc.in))
+			if got != tc.want {
+				t.Errorf("ensureTrailingNewline(normalizeNewlines(%q)) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestComputeTimeRange_InvalidDate(t *testing.T) {
 	cases := []struct {
 		name  string

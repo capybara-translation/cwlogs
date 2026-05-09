@@ -13,7 +13,7 @@ $ ./cwlogs [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlin
 - `--utc` — interpret start/end dates as UTC instead of the system's local timezone (useful in CI / containers where the host timezone is UTC).
 - `--profile <name>` — AWS shared config profile to use. If omitted, the SDK's default resolution applies (including the `AWS_PROFILE` environment variable).
 - `--region <region>` — AWS region (e.g. `us-east-1`). When omitted, the SDK resolves the region in this order: `AWS_REGION` → `AWS_DEFAULT_REGION` → the profile's `region` setting → EC2 IMDS (when running on EC2).
-- `--no-normalize-newlines` — disable newline normalization. By default, `\r\n` and standalone `\r` inside log messages are converted to `\n` so downstream tools (`grep`, `awk`, etc.) work consistently. Pass this flag to keep the original bytes (e.g. when piping to a binary-aware consumer).
+- `--no-normalize-newlines` — disable output normalization. By default cwlogs (1) converts `\r\n` and standalone `\r` inside each log message to `\n`, and (2) appends a trailing `\n` to any message that doesn't already end with one, so each event renders on its own line and downstream tools (`grep`, `awk`, etc.) work consistently. Pass this flag to emit the original bytes from CloudWatch Logs unchanged (e.g. when piping to a binary-aware consumer).
 
 Dates are interpreted in the system's local timezone by default.
 
