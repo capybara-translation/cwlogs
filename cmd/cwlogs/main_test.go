@@ -106,6 +106,37 @@ func TestComputeTimeRange_MultiDay(t *testing.T) {
 	}
 }
 
+func TestNormalizeNewlines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"no newline", "abc", "abc"},
+		{"already LF", "abc\ndef", "abc\ndef"},
+		{"CRLF", "abc\r\ndef", "abc\ndef"},
+		{"bare CR (classic Mac)", "abc\rdef", "abc\ndef"},
+		{"trailing CRLF", "abc\r\n", "abc\n"},
+		{"trailing CR", "abc\r", "abc\n"},
+		{"only CRLF", "\r\n", "\n"},
+		{"only CR", "\r", "\n"},
+		{"mixed CRLF and bare CR", "a\r\nb\rc", "a\nb\nc"},
+		{"adjacent CR then LF must not become two LFs", "a\r\nb", "a\nb"},
+		{"two CRLF", "a\r\n\r\nb", "a\n\nb"},
+		{"CR followed by another CR", "a\r\rb", "a\n\nb"},
+		{"multibyte UTF-8 around CRLF", "日本語\r\n改行\rテスト", "日本語\n改行\nテスト"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := normalizeNewlines(tc.in)
+			if got != tc.want {
+				t.Errorf("normalizeNewlines(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestComputeTimeRange_InvalidDate(t *testing.T) {
 	cases := []struct {
 		name  string
