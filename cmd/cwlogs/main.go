@@ -15,13 +15,14 @@ import (
 )
 
 func main() {
-	utc := flag.Bool("utc", false, "interpret start/end dates as UTC instead of the local timezone")
+	utc := flag.Bool("utc", false, "interpret start/end timestamps as UTC instead of the local timezone")
 	profile := flag.String("profile", "", "AWS shared config profile name (default: SDK default resolution, including AWS_PROFILE)")
 	region := flag.String("region", "", "AWS region (overrides profile/env default)")
 	noNormalizeNewlines := flag.Bool("no-normalize-newlines", false, "disable output normalization (converting \\r\\n and \\r to \\n, and appending a trailing \\n when missing)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
-			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] <log_group_name> <start_date: YYYYMMDD> <end_date: YYYYMMDD>\n",
+			"Usage: %s [--utc] [--profile <name>] [--region <region>] [--no-normalize-newlines] <log_group_name> <start> <end>\n"+
+				"  <start>, <end>: YYYYMMDD | YYYY-MM-DD | YYYY-MM-DDTHH:MM:SS\n",
 			os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -93,25 +94,77 @@ func main() {
 
 }
 
-// computeTimeRange parses startStr and endStr as YYYYMMDD in loc and returns
-// the inclusive [start, end] range in Unix milliseconds. The end time is the
-// last millisecond of the end date in loc (wall-clock 23:59:59.999), computed
-// via the next day's 00:00:00 to remain correct across DST transitions.
+// granularity records how precisely the user specified a time, which determines
+// how endOfGranularity rounds the end of the range up.
+type granularity int
+
+const (
+	granularityDay granularity = iota
+	granularitySecond
+)
+
+// parseFlexibleTime parses s in loc as one of:
+//   - YYYYMMDD              (8 chars,  granularityDay)
+//   - YYYY-MM-DD            (10 chars, granularityDay)
+//   - YYYY-MM-DDTHH:MM:SS   (19 chars, granularitySecond)
+//
+// Trailing zone designators (Z, +09:00, ...) are not accepted; the global --utc
+// flag controls how zoneless input is interpreted. The returned granularity is
+// only meaningful when err is nil.
+func parseFlexibleTime(s string, loc *time.Location) (time.Time, granularity, error) {
+	switch len(s) {
+	case 8:
+		t, err := time.ParseInLocation("20060102", s, loc)
+		return t, granularityDay, err
+	case 10:
+		t, err := time.ParseInLocation("2006-01-02", s, loc)
+		return t, granularityDay, err
+	case 19:
+		t, err := time.ParseInLocation("2006-01-02T15:04:05", s, loc)
+		return t, granularitySecond, err
+	default:
+		return time.Time{}, 0, fmt.Errorf("unrecognized format %q (expected YYYYMMDD, YYYY-MM-DD, or YYYY-MM-DDTHH:MM:SS)", s)
+	}
+}
+
+// endOfGranularity returns the first instant *after* the granule t belongs to,
+// using wall-clock semantics in loc so DST transitions do not skew the result.
+// Subtract 1 ms from the returned UnixMilli value to get the inclusive last
+// millisecond of the granule.
+func endOfGranularity(t time.Time, g granularity, loc *time.Location) time.Time {
+	switch g {
+	case granularityDay:
+		return time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, loc)
+	case granularitySecond:
+		return t.Add(time.Second)
+	default:
+		// Reaching here means a new granularity was added without updating
+		// this switch, which would silently produce a range that ends before
+		// it begins. Fail loudly instead.
+		panic(fmt.Sprintf("endOfGranularity: unhandled granularity %d", g))
+	}
+}
+
+// computeTimeRange parses startStr and endStr in loc and returns the inclusive
+// [start, end] range in Unix milliseconds. start is the first millisecond of
+// its granule; end is the last millisecond of its granule. The two arguments
+// may use different formats (e.g. day for start, second for end).
 func computeTimeRange(startStr, endStr string, loc *time.Location) (int64, int64, error) {
-	const layout = "20060102"
-
-	startDate, err := time.ParseInLocation(layout, startStr, loc)
+	start, _, err := parseFlexibleTime(startStr, loc)
 	if err != nil {
-		return 0, 0, fmt.Errorf("invalid start date format: %w", err)
+		return 0, 0, fmt.Errorf("invalid start: %w", err)
 	}
 
-	endDate, err := time.ParseInLocation(layout, endStr, loc)
+	end, endGran, err := parseFlexibleTime(endStr, loc)
 	if err != nil {
-		return 0, 0, fmt.Errorf("invalid end date format: %w", err)
+		return 0, 0, fmt.Errorf("invalid end: %w", err)
 	}
 
-	startMs := startDate.UnixMilli()
-	endMs := time.Date(endDate.Year(), endDate.Month(), endDate.Day()+1, 0, 0, 0, 0, loc).UnixMilli() - 1
+	startMs := start.UnixMilli()
+	endMs := endOfGranularity(end, endGran, loc).UnixMilli() - 1
+	if startMs > endMs {
+		return 0, 0, fmt.Errorf("start (%s) is after end (%s)", startStr, endStr)
+	}
 	return startMs, endMs, nil
 }
 

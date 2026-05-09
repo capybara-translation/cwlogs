@@ -186,7 +186,103 @@ func TestNormalizeAndEnsureNewline_Composition(t *testing.T) {
 	}
 }
 
-func TestComputeTimeRange_InvalidDate(t *testing.T) {
+func TestComputeTimeRange_HyphenatedDate(t *testing.T) {
+	startMs, endMs, err := computeTimeRange("2024-10-01", "2024-10-01", time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantStart := time.Date(2024, 10, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	wantEnd := time.Date(2024, 10, 1, 23, 59, 59, 999_000_000, time.UTC).UnixMilli()
+	if startMs != wantStart {
+		t.Errorf("startMs = %d, want %d", startMs, wantStart)
+	}
+	if endMs != wantEnd {
+		t.Errorf("endMs = %d, want %d", endMs, wantEnd)
+	}
+}
+
+func TestComputeTimeRange_SecondPrecision(t *testing.T) {
+	startMs, endMs, err := computeTimeRange("2024-10-01T12:30:00", "2024-10-01T12:30:59", time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantStart := time.Date(2024, 10, 1, 12, 30, 0, 0, time.UTC).UnixMilli()
+	wantEnd := time.Date(2024, 10, 1, 12, 30, 59, 999_000_000, time.UTC).UnixMilli()
+	if startMs != wantStart {
+		t.Errorf("startMs = %d, want %d", startMs, wantStart)
+	}
+	if endMs != wantEnd {
+		t.Errorf("endMs = %d, want %d", endMs, wantEnd)
+	}
+}
+
+func TestComputeTimeRange_MixedFormats(t *testing.T) {
+	// start = bare date (granularity Day), end = second precision.
+	startMs, endMs, err := computeTimeRange("20241001", "2024-10-01T12:00:00", time.UTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantStart := time.Date(2024, 10, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
+	wantEnd := time.Date(2024, 10, 1, 12, 0, 0, 999_000_000, time.UTC).UnixMilli()
+	if startMs != wantStart {
+		t.Errorf("startMs = %d, want %d", startMs, wantStart)
+	}
+	if endMs != wantEnd {
+		t.Errorf("endMs = %d, want %d", endMs, wantEnd)
+	}
+}
+
+func TestComputeTimeRange_SecondPrecision_DSTSpringForward(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skipf("tzdata not available: %v", err)
+	}
+
+	// 01:30 EST → 03:30 EDT spans only 1 hour of real time across the
+	// spring-forward boundary. Verify the millisecond delta reflects that.
+	startMs, endMs, err := computeTimeRange("2024-03-10T01:30:00", "2024-03-10T03:30:00", ny)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// end is the last ms of 03:30:00, so end - start == 3600s + 999ms - 1ms = 3600999.
+	gotDelta := endMs - startMs
+	wantDelta := int64(3600*1000 + 999)
+	if gotDelta != wantDelta {
+		t.Errorf("delta = %d ms, want %d ms (1 real hour across DST plus 999 ms tail)", gotDelta, wantDelta)
+	}
+}
+
+func TestComputeTimeRange_InvertedRange(t *testing.T) {
+	cases := []struct {
+		name  string
+		start string
+		end   string
+	}{
+		{"day granularity, end before start", "20241031", "20241001"},
+		{"second granularity, end before start", "2024-10-01T12:00:00", "2024-10-01T11:00:00"},
+		{"mixed granularity inverted", "2024-10-02", "2024-10-01T23:59:59"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := computeTimeRange(tc.start, tc.end, time.UTC)
+			if err == nil {
+				t.Errorf("expected inverted-range error, got nil")
+			}
+		})
+	}
+}
+
+func TestEndOfGranularity_UnknownPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("expected panic for unknown granularity, got none")
+		}
+	}()
+	endOfGranularity(time.Now(), granularity(999), time.UTC)
+}
+
+func TestComputeTimeRange_InvalidFormat(t *testing.T) {
 	cases := []struct {
 		name  string
 		start string
@@ -194,9 +290,19 @@ func TestComputeTimeRange_InvalidDate(t *testing.T) {
 	}{
 		{"non-numeric start", "BAD", "20241031"},
 		{"non-numeric end", "20241001", "BAD"},
-		{"non-existent date", "20240230", "20240301"},
-		{"hyphenated format", "2024-10-01", "20241031"},
+		{"non-existent date YYYYMMDD", "20240230", "20240301"},
+		{"non-existent date YYYY-MM-DD", "2024-02-30", "2024-03-01"},
 		{"empty start", "", "20241031"},
+		{"slash separator", "2024/10/01", "20241031"},
+		{"9-char unsupported length", "2024-10-1", "20241031"},
+		{"minute-only precision (16 chars)", "2024-10-01T12:34", "20241031"},
+		{"trailing Z (20 chars)", "2024-10-01T12:34:56Z", "20241031"},
+		{"trailing offset (25 chars)", "2024-10-01T12:34:56+09:00", "20241031"},
+		{"compact 14-char datetime not supported", "20241001120000", "20241031"},
+		{"8 spaces (correct length, wrong content)", "        ", "20241031"},
+		{"10 letters (correct length, wrong content)", "abcdefghij", "20241031"},
+		{"fullwidth digits inflate byte length", "２０２４-10-01", "20241031"},
+		{"en-dash separators inflate byte length", "2024–10–01", "20241031"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
